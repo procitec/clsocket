@@ -4,7 +4,7 @@ project(clsocket)
 
 # set up versioning.
 set(BUILD_MAJOR "1")
-set(BUILD_MINOR "4")
+set(BUILD_MINOR "5")
 set(BUILD_VERSION "3")
 set(BUILD_VERSION ${BUILD_MAJOR}.${BUILD_MINOR}.${BUILD_VERSION})
 
@@ -38,6 +38,8 @@ if(UNIX)
         # Special Apple stuff here
         remove_definitions(-D_LINUX)
         add_definitions(-D_DARWIN)
+    else()
+        OPTION(CLSOCKET_USE_POLL "Use poll() instead of select() (allows file descriptors >=1024)" ON)
     endif()
 elseif(WIN32)
     add_definitions(-DWIN32)
@@ -100,6 +102,11 @@ else()
     endif()
 endif()
 TARGET_LINK_LIBRARIES(clsocket ${PROJECT_LIBS})
+
+if(CLSOCKET_USE_POLL)
+    # CLSOCKET_USE_POLL needs to be public - for a consistent size of CSimpleSocket
+    target_compile_definitions(clsocket PUBLIC CLSOCKET_USE_POLL)
+endif()
 
 # install into configured prefix
 if(NOT CLSOCKET_DEP_ONLY)

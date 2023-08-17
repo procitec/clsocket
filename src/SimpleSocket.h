@@ -162,7 +162,8 @@ public:
         SocketAddressInUse,        ///< Address already in use.
         SocketInvalidPointer,      ///< Pointer type supplied as argument is invalid.
         SocketEunknown,            ///< Unknown error
-        SocketNetworkError         ///< Several network errors
+        SocketNetworkError,        ///< Several network errors
+        SocketTooManyOpenFiles     ///< Too many open files
     } CSocketError;
 
 public:
@@ -650,6 +651,11 @@ public:
     /// @return 0 if failed
     uint32 GetIPv4AddrInfo( const char *pAddr );
 
+    inline void EnablePerror(bool enable = true)
+    {
+        m_bPrintPerror = enable;
+    }
+
 protected:
     /// Set internal socket error to that specified error
     ///  @param error type of error
@@ -720,6 +726,7 @@ protected:
                                               ///    and m_stClientSockaddr == peerAddr()
                                               /// else: m_stClientSockaddr == localAddr()
     bool                 m_bPeerHasClosed;    /// is socket closed from peer?
+    bool                 m_bPrintPerror;
     struct timeval       m_stConnectTimeout;  /// connection timeout
     struct timeval       m_stRecvTimeout;     /// receive timeout
     struct timeval       m_stSendTimeout;     /// send timeout
@@ -731,11 +738,11 @@ protected:
 #ifdef WIN32
     WSADATA              m_hWSAData;          /// Windows
 #endif
+#ifndef CLSOCKET_USE_POLL
     fd_set               m_writeFds;          /// write file descriptor set
     fd_set               m_readFds;           /// read file descriptor set
     fd_set               m_errorFds;          /// error file descriptor set
+#endif
 };
 
-
 #endif /*  __SOCKET_H__  */
-

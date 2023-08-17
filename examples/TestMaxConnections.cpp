@@ -6,11 +6,21 @@
 #include <cstdio>
 #include <cstring>
 
-#define MAX_CLIENTS 8192
+#define MAX_CLIENTS 65536
 #define MAX_PACKET  4096
-//#define TEST_PACKET "Test Packet"
 #define TEST_PACKET "Test"
 
+
+static inline const char * errtxt(CPassiveSocket& s) {
+    return s.GetSocketErrorText();
+}
+
+static inline const char * errtxt(CSimpleSocket& s) {
+    return s.GetSocketErrorText();
+}
+
+
+typedef CSimpleSocket * CSimpleSocketPtr;
 
 struct thread_data
 {
@@ -21,7 +31,7 @@ struct thread_data
     int             nTotalPayloadSize;
     CPassiveSocket  server_socket;
     int             nClients;
-    CSimpleSocket * client_sockets[MAX_CLIENTS];
+    CSimpleSocketPtr client_sockets[MAX_CLIENTS];
     bool            terminate;
     bool            ready;
 
@@ -35,21 +45,27 @@ struct thread_data
         nClients = 0;
         terminate = false;
         ready = false;
-        for (int k=0; k < MAX_CLIENTS; ++k)
+        if (!max_clients)
+        {
+            ready = true; // pseudo, that clients can run
+            return;
+        }
+        for (int k=0; k < max_clients; ++k)
             client_sockets[k] = 0;
+        server_socket.EnablePerror();
         if (!server_socket.Initialize())
         {
-            fprintf(stderr, "Error: initializing socket!\n");
+            fprintf(stderr, "Error: initializing socket: %s\n", errtxt(server_socket));
             return;
         }
         if (!server_socket.SetNonblocking())
         {
-            fprintf(stderr, "Error: server/listen socket could set Nonblocking!\n");
+            fprintf(stderr, "Error: server/listen socket could set Nonblocking: %s\n", errtxt(server_socket));
             return;
         }
         if (!server_socket.Listen(pszServerAddr, nPort))
         {
-            fprintf(stderr, "Error: listen failed!\n");
+            fprintf(stderr, "Error: listen failed: %s\n", errtxt(server_socket));
             return;
         }
         ready = true;
@@ -57,6 +73,8 @@ struct thread_data
 
     ~thread_data()
     {
+        if (!max_clients)
+            return;
         printf("\nserver: shutting down server!\n");
         server_socket.Close();
         printf("server: cleanup/delete connections ..\n");
@@ -72,14 +90,23 @@ bool thread_data::serve()
 {
     if (!ready)
         return false;
+
+    if (!max_clients)
+    {
+        printf("empty server thread. shuts down immediately.\n");
+        return false;
+    }
+
+    int fd_max = 0;
     while (!terminate)
     {
         if (nClients >= max_clients)
         {
             fprintf(stderr, "\nserver: have served %d clients. shut down\n", nClients);
+            ready = false;
             return false;
         }
-        if (!server_socket.Select(0, 100000))  // 100ms
+        if (!server_socket.WaitUntilReadable(100))
         {
             // fprintf(stderr, "server: wait select\n");
             continue;
@@ -96,13 +123,17 @@ bool thread_data::serve()
             }
 
             fprintf(stderr, "server: Error at accept() for %d: code %d: %s\n",
-                    nClients, (int)server_socket.GetSocketError(), server_socket.DescribeError() );
+                    nClients, (int)server_socket.GetSocketError(), errtxt(server_socket));
             break;
         }
-        printf("server: accepted %d ..\n", nClients);
+        if ( fd_max < pClient->GetSocketDescriptor() )
+            fd_max = pClient->GetSocketDescriptor();
+        printf("server: accepted # %d. max fd %d\n", nClients, fd_max);
 
         client_sockets[nClients++] = pClient;
         int nBytesReceived = 0;
+        // following line consumes additional file-descriptor
+        pClient->WaitUntilReadable(100);  // wait up to 100 ms
         while (!terminate && nBytesReceived < nTotalPayloadSize)
         {
             if (nBytesReceived += pClient->Receive(nNumBytesToReceive))
@@ -113,23 +144,41 @@ bool thread_data::serve()
         // keep the new connection open!
     }
 
+    ready = false;
     return true;
 }
 
 
-bool connect_new_client(CActiveSocket &client, int k, const thread_data &thData)
+static bool init_client(CSimpleSocket &client, int k)
+{
+    client.EnablePerror();
+    if (!client.Initialize())
+    {
+        fprintf(stderr, "Error: socket %d could not get initialized: %s\n", k, errtxt(client));
+        return false;
+    }
+    if (!client.SetNonblocking())
+    {
+        fprintf(stderr, "Error: socket %d could not set Nonblocking: %s\n", k, errtxt(client));
+        return false;
+    }
+    return true;
+}
+
+
+static bool connect_new_client(CSimpleSocket &client, int k, const thread_data &thData)
 {
     bool conn_ok = client.Open("127.0.0.1", 6789);
     if (!conn_ok)
     {
-        fprintf(stderr, "Error: %d could not connect to server!\n", k);
+        fprintf(stderr, "Error: %d could not connect to server: %s\n", k, errtxt(client));
         return false;
     }
 
     int32 r = client.Send((uint8 *)TEST_PACKET, strlen(TEST_PACKET));
     if (!r)
     {
-        fprintf(stderr, "Error: connection %d closed from peer while sending packet!\n", k);
+        fprintf(stderr, "Error: connection %d closed from peer while sending packet: %s\n", k, errtxt(client));
         return false;
     }
 
@@ -140,7 +189,7 @@ bool connect_new_client(CActiveSocket &client, int k, const thread_data &thData)
     client.WaitUntilReadable(100);  // wait up to 100 ms
 
     // Receive() until socket gets closed or we already received the full packet
-    while ( numBytes != 0 && bytesReceived < thData.nTotalPayloadSize )
+    while ( numBytes != 0 && thData.ready && bytesReceived < thData.nTotalPayloadSize )
     {
         numBytes = client.Receive(MAX_PACKET);
 
@@ -158,7 +207,7 @@ bool connect_new_client(CActiveSocket &client, int k, const thread_data &thData)
         {
             printf("\n%d: received %d bytes\n", k, numBytes);
 
-            fprintf(stderr, "Error: %s\n", client.DescribeError() );
+            fprintf(stderr, "Error: %s\n", errtxt(client) );
             fprintf(stderr, "Error: %s, code %d\n"
                     , ( client.IsNonblocking() ? "NonBlocking socket" : "Blocking socket" )
                     , (int) client.GetSocketError()
@@ -182,7 +231,7 @@ bool connect_new_client(CActiveSocket &client, int k, const thread_data &thData)
     }
     if (!numBytes)
     {
-        fprintf(stderr, "Error: connection %d closed from peer\n", k);
+        fprintf(stderr, "Error: connection %d closed from peer: %s\n", k, errtxt(client));
         return false;
     }
     return true;
@@ -192,88 +241,132 @@ bool connect_new_client(CActiveSocket &client, int k, const thread_data &thData)
 
 int main(int argc, char **argv)
 {
-    int max_clients = MAX_CLIENTS;
+    // max calculation:
+    // assuming 'ulimit -n' = 8192:
+    // - 4 descriptors for stdin, stdout, stderr and also one server socket
+    // - 4 descriptors per connection: 2 at server (socket + epoll) and 2 at client
+    // the additional file-descriptor for epoll is needed with first internal Select() ..
+    int max_clients = (8192 - 4) / 4;
+
     int init_sockets_at_startup = 1;
 
-    if ( 1 < argc )
+    if ( 1 < argc
+        && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-help") || !strcmp(argv[1], "-h") || !strcmp(argv[1], "/h"))
+        )
     {
-        if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-help") || !strcmp(argv[1], "-h") || !strcmp(argv[1], "/h"))
-        {
-            printf("usage: %s [<max_num_connections> [<init_sockets_at_startup>] ]\n", argv[0]);
-            printf("  max_num_connections: number of connections to test. default = %d, max = %d\n", max_clients, max_clients);
-            printf("  init_sockets_at_startup: 0 or 1. default = %d\n", init_sockets_at_startup);
-            return 0;
-        }
-        max_clients = atoi(argv[1]);
+        printf("usage: %s [-s|-c] [<max_num_connections> [<init_sockets_at_startup>] ]\n", argv[0]);
+        printf("  -s : run only server\n");
+        printf("  -c : run only client(s)\n");
+        printf("       by default, server and client(s) are run\n");
+        printf("  max_num_connections: number of connections to test. default = %d, max = %d\n", max_clients, max_clients);
+        printf("  init_sockets_at_startup: 0 or 1. default = %d\n", init_sockets_at_startup);
+#ifdef __linux__
+        printf("\nprobably necessary things on Linux:\n");
+        printf("an additional 'ulimit -n <max>' might be necessary\n");
+        printf("see https://www.cyberciti.biz/faq/linux-increase-the-maximum-number-of-open-files/\n");
+        printf("  cat /proc/sys/fs/file-max\n");
+        printf("  sysctl fs.file-max\n");
+        printf("  sysctl -w fs.file-max=100000\n");
+        printf("  sudo nano /etc/security/limits.conf   # and add following lines replacing 'user'\n");
+        printf("    user soft nofile 1048576\n");
+        printf("    user hard nofile 1048576  # save and exit - probably logoff and login\n");
+        printf("  ulimit -n <max>\n");
+        printf("  ulimit -n  # to verfiy new soft limit\n\n");
+#endif
+        return 0;
     }
 
-    if ( 2 < argc )
-        init_sockets_at_startup = atoi(argv[2]);
+    int argoff = 0;
+    bool run_server = true, run_clients = true;
+    if (1 < argc && !strcmp(argv[1], "-s"))
+    {
+        ++argoff;
+        run_clients = false;
+    }
+    if (1 < argc && !strcmp(argv[1], "-c"))
+    {
+        ++argoff;
+        run_server = false;
+    }
+
+    if ( argoff+1 < argc )
+    {
+        max_clients = atoi(argv[argoff+1]);
+    }
+
+    if ( argoff+2 < argc )
+        init_sockets_at_startup = atoi(argv[argoff+2]);
 
     if (max_clients >= MAX_CLIENTS)
         max_clients = MAX_CLIENTS;
 
-    thread_data thData{max_clients};
-    if (!thData.ready)
-        return 1;
-    std::thread server_thread(&thread_data::serve, &thData);
-
-    CActiveSocket * clients = new CActiveSocket[MAX_CLIENTS];
     printf("try to setup/communicate %d conncections ..\n", max_clients);
 
-    bool have_err = false;
-    if (init_sockets_at_startup)
+    thread_data *pThData = new thread_data{run_server ? max_clients : 0};
+    thread_data &thData = *pThData;
+    if (run_server && !thData.ready)
+        return 1;
+
+    std::thread server_thread(&thread_data::serve, &thData);
+
+    if (run_clients)
     {
-        for (int k = 0; k < max_clients; ++k)
+        CSimpleSocketPtr * clients = new CSimpleSocketPtr[max_clients];
+        int fd_max = 0;
+
+        bool have_err = false;
+        if (init_sockets_at_startup)
         {
-            CActiveSocket &client = clients[k];
-            printf("init socket %d ..\n", k);
-            if (!client.Initialize())
+            for (int k = 0; k < max_clients; ++k)
             {
-                fprintf(stderr, "Error: socket %d could get initialized!\n", k);
-                have_err = true;
-                break;
-            }
-            if (!client.SetNonblocking())
-            {
-                fprintf(stderr, "Error: socket %d could set Nonblocking!\n", k);
-                have_err = true;
-                break;
+                clients[k] = new CSimpleSocket();
+                CSimpleSocket &client = *clients[k];
+                printf("init socket %d ..\n", k);
+                if (!init_client(client, k))
+                {
+                    have_err = true;
+                    break;
+                }
             }
         }
-    }
 
-    for (int k = 0; !have_err && k < max_clients; ++k)
-    {
-        CActiveSocket &client = clients[k];
-        printf("\nclient %d ..\n", k);
-        if (!init_sockets_at_startup)
+        for (int k = 0; !have_err && thData.ready && k < max_clients; ++k)
         {
-            if (!client.Initialize())
+            if (!init_sockets_at_startup)
             {
-                fprintf(stderr, "Error: socket %d could get initialized!\n", k);
-                break;
+                clients[k] = new CSimpleSocket();
+                if (!init_client(*clients[k], k))
+                    break;
             }
-            if (!client.SetNonblocking())
-            {
-                fprintf(stderr, "Error: socket %d could set Nonblocking!\n", k);
-                break;
-            }
+            CSimpleSocket &client = *clients[k];
+            int fd = client.GetSocketDescriptor();
+            if ( fd_max < fd )
+                fd_max = fd;
+
+            printf("\nclient %d (socket fd %d, max fd %d) ..\n", k, fd, fd_max);
+            have_err = !connect_new_client(client, k, thData);
         }
-        have_err = !connect_new_client(client, k, thData);
-    }
 
-    thData.terminate = true;
-    printf("trigger server to terminate ..\n");
+        thData.terminate = true;
+        if (run_server)
+            printf("trigger server to terminate ..\n");
+        else
+            printf("can't trigger server to terminate. close server process.\n");
 
-    printf("cleanup clients connections ..\n");
-    for (int k=0; k < MAX_CLIENTS; ++k)
-    {
-        CActiveSocket &client = clients[k];
-        if (client.IsSocketValid())
-            client.Close();
+        printf("cleanup clients connections ..\n");
+        for (int k=0; k < max_clients; ++k)
+        {
+            if (!clients[k])
+                continue;
+            CSimpleSocket &client = *clients[k];
+            if (client.IsSocketValid())
+                client.Close();
+            delete clients[k];
+        }
+        delete []clients;
     }
-    delete []clients;
 
     server_thread.join();
+    delete pThData;
+    return 0;
 }

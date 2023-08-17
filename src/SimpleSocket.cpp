@@ -48,6 +48,10 @@
 #include <string.h>
 #include <assert.h>
 
+#ifdef CLSOCKET_USE_POLL
+#include <poll.h>
+#endif
+
 #ifdef CLSOCKET_OWN_INET_PTON
 #include <stdint.h>
 #endif
@@ -254,7 +258,8 @@ CSimpleSocket::CSimpleSocket(CSocketType nType) :
     m_nBytesSent(-1), m_nFlags(0),
     m_bIsBlocking(true),
     m_bIsServerSide(false),
-    m_bPeerHasClosed(true)
+    m_bPeerHasClosed(true),
+    m_bPrintPerror(false)
 {
     memset(&m_stConnectTimeout, 0, sizeof(struct timeval));
     memset(&m_stRecvTimeout, 0, sizeof(struct timeval));
@@ -319,6 +324,7 @@ CSimpleSocket::CSimpleSocket(CSocketType nType) :
     }
 }
 
+
 CSimpleSocket::CSimpleSocket(CSimpleSocket &socket)
 {
     m_pBuffer = new uint8[socket.m_nBufferSize];
@@ -346,7 +352,6 @@ CSimpleSocket *CSimpleSocket::operator=(CSimpleSocket &socket)
         m_nBufferSize = socket.m_nBufferSize;
         memcpy(m_pBuffer, socket.m_pBuffer, socket.m_nBufferSize);
     }
-
     return this;
 }
 
@@ -1950,6 +1955,11 @@ void CSimpleSocket::TranslateSocketError(void)
   // it's quite difficult to map all of them to some CSocketError!
 #if defined(_LINUX) || defined(_DARWIN)
     int systemErrno = errno;
+    if (m_bPrintPerror && systemErrno != EXIT_SUCCESS && systemErrno != EINPROGRESS)
+    {
+        fprintf(stderr, "\nclsocket error: errno %d: ", systemErrno);
+        perror(NULL);
+    }
     switch (systemErrno)
     {
     case EXIT_SUCCESS:
@@ -1962,7 +1972,6 @@ void CSimpleSocket::TranslateSocketError(void)
     case EBADF:
     case EACCES:
     case EAFNOSUPPORT:
-    case EMFILE:
     case ENFILE:
     case ENOBUFS:
     case ENOMEM:
@@ -1970,6 +1979,9 @@ void CSimpleSocket::TranslateSocketError(void)
     case EPIPE:
     case EOPNOTSUPP:
         SetSocketError(CSimpleSocket::SocketInvalidSocket);
+        break;
+    case EMFILE:
+        SetSocketError(CSimpleSocket::SocketTooManyOpenFiles);
         break;
     case ECONNREFUSED :
         SetSocketError(CSimpleSocket::SocketConnectionRefused);
@@ -2145,6 +2157,8 @@ const char *CSimpleSocket::DescribeError(CSocketError err)
             return "Unknown error";
         case CSimpleSocket::SocketNetworkError:
             return "Network error";
+        case SocketTooManyOpenFiles:
+            return "Too many open files";
         default:
             return "No such CSimpleSocket error";
     }
@@ -2158,44 +2172,56 @@ const char *CSimpleSocket::DescribeError(CSocketError err)
 bool CSimpleSocket::Select(int32 nTimeoutSec, int32 nTimeoutUSec, bool bAwakeWhenReadable, bool bAwakeWhenWritable)
 {
     bool            bRetVal = false;
-    struct timeval *pTimeout = NULL;
-    struct timeval  timeout;
     int32           nNumDescriptors = -1;
     int32           nError = 0;
 
-    // if (m_socket >= 1024)
-    // {
-    //         SetSocketError(CSimpleSocket::SocketEunknown);
-    //         fprintf(stderr, "error: select() with socket %d >= 1024\n", m_socket);
-    //         // return false;
-    // }
+    if (!IsSocketValid())
+        return bRetVal;
 
-    FD_ZERO(&m_errorFds);
-    FD_ZERO(&m_readFds);
-    FD_ZERO(&m_writeFds);
-
-    if ( bAwakeWhenReadable )
-        FD_SET(m_socket, &m_readFds);
-    if ( bAwakeWhenWritable )
-        FD_SET(m_socket, &m_writeFds);
-
-    FD_SET(m_socket, &m_errorFds);
-
-    //---------------------------------------------------------------------
-    // If timeout has been specified then set value, otherwise set timeout
-    // to NULL which will block until a descriptor is ready for read/write
-    // or an error has occurred.
-    //---------------------------------------------------------------------
-    if ((nTimeoutSec > 0) || (nTimeoutUSec > 0))
+#ifdef CLSOCKET_USE_POLL
+    struct pollfd fds[1];
     {
-        timeout.tv_sec = nTimeoutSec;
-        timeout.tv_usec = nTimeoutUSec;
-        pTimeout = &timeout;
+        fds[0].fd = m_socket;
+        fds[0].events = (bAwakeWhenReadable ? POLLIN + POLLPRI : 0) + (bAwakeWhenWritable ? POLLOUT : 0);
+
+        ClearSystemError();
+
+        int nTimeoutMillis = (nTimeoutSec || nTimeoutUSec) ? (nTimeoutSec * 1000 + (nTimeoutUSec / 1000)) : -1;
+        nNumDescriptors = poll(fds, 1, nTimeoutMillis);
     }
+#else
+    {
+        struct timeval *pTimeout = NULL;
+        struct timeval  timeout;
 
-    ClearSystemError();
+        FD_ZERO(&m_errorFds);
+        FD_ZERO(&m_readFds);
+        FD_ZERO(&m_writeFds);
 
-    nNumDescriptors = SELECT(m_socket+1, &m_readFds, &m_writeFds, &m_errorFds, pTimeout);
+        if ( bAwakeWhenReadable )
+            FD_SET(m_socket, &m_readFds);
+        if ( bAwakeWhenWritable )
+            FD_SET(m_socket, &m_writeFds);
+
+        FD_SET(m_socket, &m_errorFds);
+
+        //---------------------------------------------------------------------
+        // If timeout has been specified then set value, otherwise set timeout
+        // to NULL which will block until a descriptor is ready for read/write
+        // or an error has occurred.
+        //---------------------------------------------------------------------
+        if ((nTimeoutSec > 0) || (nTimeoutUSec > 0))
+        {
+            timeout.tv_sec = nTimeoutSec;
+            timeout.tv_usec = nTimeoutUSec;
+            pTimeout = &timeout;
+        }
+
+        ClearSystemError();
+
+        nNumDescriptors = SELECT(m_socket+1, &m_readFds, &m_writeFds, &m_errorFds, pTimeout);
+    }
+#endif
 
     //----------------------------------------------------------------------
     // Handle timeout
@@ -2209,13 +2235,23 @@ bool CSimpleSocket::Select(int32 nTimeoutSec, int32 nTimeoutUSec, bool bAwakeWhe
     //----------------------------------------------------------------------
     else if ( nNumDescriptors == SocketError )
     {
-      TranslateSocketError();
+        if (m_bPrintPerror)
+#ifdef CLSOCKET_USE_POLL
+            fprintf(stderr, "error at poll() for socket %d\n", m_socket);
+#else
+            fprintf(stderr, "error at select() for socket %d\n", m_socket);
+#endif
+        TranslateSocketError();
     }
     //----------------------------------------------------------------------
     // If a file descriptor (read/write) is set then check the
     // socket error (SO_ERROR) to see if there is a pending error.
     //----------------------------------------------------------------------
+#ifdef CLSOCKET_USE_POLL
+    else if ( fds[0].revents )
+#else
     else if ((FD_ISSET(m_socket, &m_readFds)) || (FD_ISSET(m_socket, &m_writeFds)))
+#endif
     {
         int32 nLen = sizeof(nError);
 
@@ -2234,4 +2270,3 @@ bool CSimpleSocket::Select(int32 nTimeoutSec, int32 nTimeoutUSec, bool bAwakeWhe
 
     return bRetVal;
 }
-
