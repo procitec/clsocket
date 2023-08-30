@@ -287,6 +287,11 @@ public:
     }
 
     /// Attempts to receive a block of data on an established connection.
+    /// @warning When using UDP, both POSIX (Linux) and Windows handle whole datagrams only.
+    /// You \em must provide a sufficiently large receive buffer. If the supplied buffer is
+    /// too small, excess data is discarded on Linux (see <tt>man 3p recv()<tt>,
+    /// <tt>man 2 recv<tt>, <tt>man 7 udp<tt>); Windows sets an error [1].
+    /// [1] https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-recv
     /// @param nMaxBytes maximum number of bytes to receive.
     /// @param pBuffer, memory where to receive the data,
     ///        NULL receives to internal buffer returned with GetData()
@@ -302,6 +307,9 @@ public:
 
 
     /// Attempts to return the number of Bytes waiting at next Receive()
+    /// @warning The returned value is platform dependent for UDP sockets! On Linux,
+    /// the size of the next pending datagram is returned (see <tt>man 7 udp</tt>).
+    /// On Windows, the @e total amount of data available is returned.
     /// @return number of bytes ready for Receive()
     /// @return of -1 means that an error has occurred.
     virtual int32 GetNumReceivableBytes();
